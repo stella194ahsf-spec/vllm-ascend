@@ -404,7 +404,6 @@ to download [AI-ModelScope/MMMU](https://modelscope.cn/datasets/AI-ModelScope/MM
 | ------- | ------ | ---- | -------- | --------------------- |
 | mmmu | accuracy | gen | 1 A3 series (64GB x 16) node | 83.3 |
 | gpqa | accuracy | gen | 1 A3 series (64GB x 16) node | 83.3 |
-```
 
 ## 8 Performance Evaluation
 
