@@ -96,6 +96,17 @@ def _apply_kv_cache_dtype_int8_patch() -> None:
     call multiple times / across plugin entry points (the ``force`` flag
     rebuilds even though ``__pydantic_complete__`` is already True).
     """
+    # ``KV_CACHE_DTYPES`` is a mutable mirror snapshotted from the Literal at
+    # import time; ``CacheConfig._validate_cache_dtype`` gates on that list,
+    # not on the Literal. Widening only the Literal therefore still fails with
+    # "Invalid kv_cache_dtype". Append before the idempotency check so a second
+    # call (already-widened Literal) still repairs the mirror list.
+    mirror_list = getattr(_cache_mod, "KV_CACHE_DTYPES", None)
+    if mirror_list is not None:
+        for dtype in ("int8", "mxfp8"):
+            if dtype not in mirror_list:
+                mirror_list.append(dtype)
+
     # Idempotency: if int8 is already accepted, nothing to do.
     existing_args = getattr(_ORIG_CACHE_DTYPE, "__args__", ())
     if "int8" in existing_args and "mxfp8" in existing_args:
