@@ -1205,7 +1205,8 @@ class KVCacheRecvingThread(threading.Thread):
             )
             cache.index_copy_(0, block_ids_tensor, transposed)
 
-        for _, (k_cache_layer, v_cache_layer) in group_kv_caches.items():
+        for _, layer_caches in group_kv_caches.items():
+            k_cache_layer, v_cache_layer = list(layer_caches)[:2]
             _transpose_cache_by_block(k_cache_layer)
             _transpose_cache_by_block(v_cache_layer)
 
@@ -1322,8 +1323,12 @@ class KVCacheRecvingThread(threading.Thread):
 
     @staticmethod
     def _get_kv_cache_dims_from_tensors(kv_caches: dict[str, Any]) -> tuple[int, int, int]:
-        """Return (num_kv_heads, k_head_dim, v_head_dim) from registered KV cache tensors."""
-        k_cache, v_cache = next(iter(kv_caches.values()))
+        """Return (num_kv_heads, k_head_dim, v_head_dim) from registered KV cache tensors.
+
+        Layers may bind more than two components (dynamic C8A16 also carries
+        K/V fp32 scale planes); only the first two are K and V.
+        """
+        k_cache, v_cache = list(next(iter(kv_caches.values())))[:2]
         return int(k_cache.shape[-2]), int(k_cache.shape[-1]), int(v_cache.shape[-1])
 
     def reformat_kv_cache_with_fused_op(
@@ -1344,7 +1349,8 @@ class KVCacheRecvingThread(threading.Thread):
 
         k_caches = []
         v_caches = []
-        for _, (k_cache_layer, v_cache_layer) in kv_caches.items():
+        for _, layer_caches in kv_caches.items():
+            k_cache_layer, v_cache_layer = list(layer_caches)[:2]
             k_caches.append(k_cache_layer)
             v_caches.append(v_cache_layer)
 
@@ -1392,7 +1398,8 @@ class KVCacheRecvingThread(threading.Thread):
         torch.npu.synchronize()
 
         # Process each layer in the KV cache
-        for _, (k_cache_layer, v_cache_layer) in kv_caches.items():
+        for _, layer_caches in kv_caches.items():
+            k_cache_layer, v_cache_layer = list(layer_caches)[:2]
             # Load cache data into buffers
             torch_npu.npu_gather_pa_kv_cache(
                 k_cache_layer,

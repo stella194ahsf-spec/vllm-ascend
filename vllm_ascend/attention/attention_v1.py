@@ -101,6 +101,12 @@ class AscendAttentionBackend(AttentionBackend):
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
 
             return AscendAttentionDCPMetadataBuilder
+        from vllm_ascend.attention.attention_c8a16 import AscendC8A16MetadataBuilder, should_use_c8a16_dynamic
+
+        vllm_config = get_current_vllm_config()
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is not None and should_use_c8a16_dynamic(vllm_config, cache_config.cache_dtype):
+            return AscendC8A16MetadataBuilder
         return AscendAttentionMetadataBuilder
 
     @classmethod
@@ -618,11 +624,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # MXFP8 is switched on by --kv-cache-dtype itself, so it must
             # not be gated by the recipe-derived C8 flag.
             if not self.enable_c8_quant and not is_c8_mxfp_kv_quant(self.vllm_config):
-                raise ValueError(
-                    "The current GQA‑related models adopt static quantization. "
-                    "KV quantization is configured via `--kv‑cache‑dtype` upon service startup, "
-                    "and the corresponding quantized weights are required."
+                from vllm_ascend.attention.attention_c8a16 import (
+                    AscendC8A16AttentionBackendImpl,
+                    should_use_c8a16_dynamic,
                 )
+
+                # Plain int8 without a quantization recipe means dynamic
+                # C8A16: per-token quantization needs no checkpoint scales.
+                # The class swap selects the dynamic forward paths; static
+                # recipe C8 swaps the class later in create_weights.
+                if should_use_c8a16_dynamic(self.vllm_config, self.kv_cache_dtype):
+                    self.__class__ = AscendC8A16AttentionBackendImpl
+                    from vllm.logger import logger
+
+                    logger.info("C8A16: dynamic INT8 KV cache attention enabled (per-token dyn quant, BF16 attention).")
+                else:
+                    raise ValueError(
+                        "The current GQA‑related models adopt static quantization. "
+                        "KV quantization is configured via `--kv‑cache‑dtype` upon service startup, "
+                        "and the corresponding quantized weights are required."
+                    )
         self._use_layer_aware_fia_graph_replay = needs_layer_aware_fia_graph_replay()
         self._use_max_workspace_for_fia_graph = self._use_layer_aware_fia_graph_replay
         self.sinks = sinks

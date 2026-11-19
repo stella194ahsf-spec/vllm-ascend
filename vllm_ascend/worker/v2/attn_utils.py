@@ -360,6 +360,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
         if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
             spec = mxfp_cache_spec(spec)
+        elif type(spec) is FullAttentionSpec and _uses_c8a16_dynamic(vllm_config):
+            # Budget the two dynamic fp32 scale planes inside each page so the
+            # runner can allocate them with the K/V payload instead of after
+            # initialization, and so PD registration covers them.
+            from vllm_ascend.attention.attention_c8a16 import c8a16_cache_spec
+
+            spec = c8a16_cache_spec(spec)
         # vLLM #42309 annotates EAGLE groups from ``spec.is_draft``, tagged on
         # the spec while specs are built. The v0.32.0 lane has no ``is_draft``
         # field and annotates EAGLE groups through the packed hook, so only main
@@ -723,6 +730,16 @@ def _get_layer_kv_cache_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCac
             else:
                 layer_kv_cache_spec[layer_name] = group_spec
     return layer_kv_cache_spec
+
+
+def _uses_c8a16_dynamic(vllm_config: VllmConfig) -> bool:
+    """Whether plain INT8 KV cache routes to the dynamic C8A16 backend."""
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is None:
+        return False
+    from vllm_ascend.attention.attention_c8a16 import should_use_c8a16_dynamic
+
+    return should_use_c8a16_dynamic(vllm_config, cache_config.cache_dtype)
 
 
 def _is_dsv4_model(vllm_config: VllmConfig) -> bool:
@@ -1742,6 +1759,38 @@ def _reshape_kv_cache_v2(
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
                 kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                continue
+
+            if type(kv_cache_spec) is FullAttentionSpec and _uses_c8a16_dynamic(vllm_config):
+                # The runner budgets K, V and both fp32 scale planes in one
+                # allocation so PD registration covers them; the views split
+                # that allocation into the four components the attention
+                # layer binds.
+                from vllm_ascend.attention.attention_c8a16 import c8a16_cache_views_for_spec
+
+                raw_cache = kv_cache_raw_tensors[layer_name]
+                if not isinstance(raw_cache, torch.Tensor):
+                    raise ValueError("C8A16 dynamic cache requires one combined raw allocation per layer.")
+                # Mirrors the physical pitch used by the generic path below:
+                # a hybrid planner pads the page up to the Mamba page.
+                physical_page_bytes = (
+                    kv_cache_spec.page_size_padded
+                    if kv_cache_spec.page_size_padded is not None
+                    else kv_cache_spec.page_size_bytes
+                )
+                if raw_cache.numel() % physical_page_bytes:
+                    raise ValueError(f"KV cache for {layer_name} is not a whole number of pages.")
+                blocks_per_kv_block = get_storage_block_size(kv_cache_spec) // kernel_block_size
+                scheduler_pages = raw_cache.numel() // physical_page_bytes
+                kv_caches[layer_name] = c8a16_cache_views_for_spec(
+                    raw_cache,
+                    scheduler_pages * blocks_per_kv_block,
+                    physical_page_bytes // blocks_per_kv_block,
+                    kernel_block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    kv_cache_spec.head_size_v,
+                )
                 continue
 
             if qwen4_cache_layout is not None:

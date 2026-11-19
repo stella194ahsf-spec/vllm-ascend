@@ -262,6 +262,11 @@ class MooncakeBaseConnectorWorker:
     def _get_transfer_block_shape(spec: KVCacheSpec, cache: torch.Tensor) -> tuple[int, ...]:
         """Describe single-head NHD as byte-equivalent HND without changing the cache."""
         shape = tuple(cache.shape[1:])
+        if len(shape) != 3:
+            # Component caches such as the dynamic C8A16 fp32 scale planes are
+            # [blocks, kv_heads, block_size]; they carry no head/token axis to
+            # reinterpret and transfer as raw bytes under the same page pitch.
+            return shape
         if (
             not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
             or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec))
