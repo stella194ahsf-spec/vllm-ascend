@@ -114,6 +114,10 @@ def main():
         gpu_memory_utilization=0.80,
         block_size=128,
         seed=2026,
+        # vLLM's LLM() defaults disable_log_stats=True, which makes
+        # get_metrics() assert 'Stat logging disabled'. The spec-decode
+        # counters read below come from /metrics, so they must be enabled.
+        disable_log_stats=False,
         language_model_only=True,
         worker_extension_cls="validation.c8a16.mtp_validation.C8A16ValidationWorker",
     )
