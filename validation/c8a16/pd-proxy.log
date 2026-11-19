@@ -1,0 +1,14 @@
+INFO:     Started server process [21621]
+INFO:     Waiting for application startup.
+2026-11-18 16:55:56,077 INFO [load_balance_proxy_server_example] Initialized 1 prefill clients and 1 decode clients in worker 21621.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:9000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:56528 - "GET /v1/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47852 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52518 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48016 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55414 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50338 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53250 - "GET /health HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:53260 - "GET /v1/models HTTP/1.1" 200 OK

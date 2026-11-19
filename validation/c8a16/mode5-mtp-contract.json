@@ -1,0 +1,60 @@
+{
+  "torch": "2.10.0+cpu",
+  "torch_npu": "2.10.0.post7",
+  "kv_lengths": [
+    129,
+    133
+  ],
+  "contract": "query j sees KV length L-Sq+j+1",
+  "results": [
+    {
+      "query_length": 1,
+      "sparse_mode": 0,
+      "mask": "None",
+      "max_abs": 0.001953125,
+      "per_query_max_abs": [
+        0.001953125
+      ],
+      "status": "pass"
+    },
+    {
+      "query_length": 1,
+      "sparse_mode": 3,
+      "mask": "upper_triangular_2048",
+      "max_abs": 3.9697265625,
+      "per_query_max_abs": [
+        3.9697265625
+      ],
+      "status": "fail",
+      "error": "Tensor-likes are not close!\n\nMismatched elements: 4014 / 4096 (98.0%)\nGreatest absolute difference: 3.9697265625 at index (0, 0, 2, 215) (up to 0.02 allowed)\nGreatest relative difference: 6903.19580078125 at index (0, 0, 1, 131) (up to 0.02 allowed)"
+    },
+    {
+      "query_length": 2,
+      "sparse_mode": 0,
+      "mask": "None",
+      "status": "fail",
+      "error": "npu_fused_infer_attention_score_symint:../third_party/op-plugin/op_plugin/ops/opapi/FusedInferAttentionScoreKernelNpuOpApi.cpp:425 NPU function error: call aclnnFusedInferAttentionScoreV3 failed, error code is 561103\n[ERROR] 2026-11-18-08:00:27 (PID:1756, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 1756] 2026-11-18-08:00:27.885.789 Execution_Error(EZ1008): Failed to execute operator aclnnFusedInferAttentionScoreV3_52_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Solution: 1.If the tiling function does not exist, check whether the tiling function is registered successfully. 2.If the tiling function fails to be executed, check the implementation logic of the tiling function.\nTraceBack (most recent call last):\n        the key's quant mode(5) or the value's quant mode(5) is not correct, the key/value's quant mode only support per-token and per-channel when the key/value's dequant scale is enabled[FUNC:RunBigKernelTilingWithParams][FILE:prompt_flash_attention_tiling.cpp][LINE:5035]\n        tiling process for pfa failed[FUNC:TilingFusedInferAttentionScore][FILE:fused_infer_attention_score_tiling.cpp][LINE:2504]\n        Failed to execute operator aclnnFusedInferAttentionScoreV3_52_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Kernel GetWorkspace failed. opType: 9\n        FusedInferAttentionScore LaunchAicore failed.\n"
+    },
+    {
+      "query_length": 2,
+      "sparse_mode": 3,
+      "mask": "upper_triangular_2048",
+      "status": "fail",
+      "error": "npu_fused_infer_attention_score_symint:../third_party/op-plugin/op_plugin/ops/opapi/FusedInferAttentionScoreKernelNpuOpApi.cpp:425 NPU function error: call aclnnFusedInferAttentionScoreV3 failed, error code is 561103\n[ERROR] 2026-11-18-08:00:27 (PID:1756, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 1756] 2026-11-18-08:00:27.886.717 Execution_Error(EZ1008): Failed to execute operator aclnnFusedInferAttentionScoreV3_53_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Solution: 1.If the tiling function does not exist, check whether the tiling function is registered successfully. 2.If the tiling function fails to be executed, check the implementation logic of the tiling function.\nTraceBack (most recent call last):\n        the key's quant mode(5) or the value's quant mode(5) is not correct, the key/value's quant mode only support per-token and per-channel when the key/value's dequant scale is enabled[FUNC:RunBigKernelTilingWithParams][FILE:prompt_flash_attention_tiling.cpp][LINE:5035]\n        tiling process for pfa failed[FUNC:TilingFusedInferAttentionScore][FILE:fused_infer_attention_score_tiling.cpp][LINE:2504]\n        Failed to execute operator aclnnFusedInferAttentionScoreV3_53_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Kernel GetWorkspace failed. opType: 9\n        FusedInferAttentionScore LaunchAicore failed.\n"
+    },
+    {
+      "query_length": 4,
+      "sparse_mode": 0,
+      "mask": "None",
+      "status": "fail",
+      "error": "npu_fused_infer_attention_score_symint:../third_party/op-plugin/op_plugin/ops/opapi/FusedInferAttentionScoreKernelNpuOpApi.cpp:425 NPU function error: call aclnnFusedInferAttentionScoreV3 failed, error code is 561103\n[ERROR] 2026-11-18-08:00:27 (PID:1756, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 1756] 2026-11-18-08:00:27.889.230 Execution_Error(EZ1008): Failed to execute operator aclnnFusedInferAttentionScoreV3_74_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Solution: 1.If the tiling function does not exist, check whether the tiling function is registered successfully. 2.If the tiling function fails to be executed, check the implementation logic of the tiling function.\nTraceBack (most recent call last):\n        the key's quant mode(5) or the value's quant mode(5) is not correct, the key/value's quant mode only support per-token and per-channel when the key/value's dequant scale is enabled[FUNC:RunBigKernelTilingWithParams][FILE:prompt_flash_attention_tiling.cpp][LINE:5035]\n        tiling process for pfa failed[FUNC:TilingFusedInferAttentionScore][FILE:fused_infer_attention_score_tiling.cpp][LINE:2504]\n        Failed to execute operator aclnnFusedInferAttentionScoreV3_74_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Kernel GetWorkspace failed. opType: 9\n        FusedInferAttentionScore LaunchAicore failed.\n"
+    },
+    {
+      "query_length": 4,
+      "sparse_mode": 3,
+      "mask": "upper_triangular_2048",
+      "status": "fail",
+      "error": "npu_fused_infer_attention_score_symint:../third_party/op-plugin/op_plugin/ops/opapi/FusedInferAttentionScoreKernelNpuOpApi.cpp:425 NPU function error: call aclnnFusedInferAttentionScoreV3 failed, error code is 561103\n[ERROR] 2026-11-18-08:00:27 (PID:1756, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 1756] 2026-11-18-08:00:27.889.752 Execution_Error(EZ1008): Failed to execute operator aclnnFusedInferAttentionScoreV3_75_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Solution: 1.If the tiling function does not exist, check whether the tiling function is registered successfully. 2.If the tiling function fails to be executed, check the implementation logic of the tiling function.\nTraceBack (most recent call last):\n        the key's quant mode(5) or the value's quant mode(5) is not correct, the key/value's quant mode only support per-token and per-channel when the key/value's dequant scale is enabled[FUNC:RunBigKernelTilingWithParams][FILE:prompt_flash_attention_tiling.cpp][LINE:5035]\n        tiling process for pfa failed[FUNC:TilingFusedInferAttentionScore][FILE:fused_infer_attention_score_tiling.cpp][LINE:2504]\n        Failed to execute operator aclnnFusedInferAttentionScoreV3_75_FusedInferAttentionScore. Reason: Failed to execute tiling.\n        Kernel GetWorkspace failed. opType: 9\n        FusedInferAttentionScore LaunchAicore failed.\n"
+    }
+  ]
+}

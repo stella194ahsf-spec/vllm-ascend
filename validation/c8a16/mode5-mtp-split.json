@@ -1,0 +1,54 @@
+{
+  "torch": "2.10.0+cpu",
+  "torch_npu": "2.10.0.post7",
+  "kv_lengths": [
+    129,
+    133
+  ],
+  "contract": "query j sees KV length L-Sq+j+1",
+  "results": [
+    {
+      "query_length": 1,
+      "strategy": "split",
+      "sparse_mode": 0,
+      "mask": "None",
+      "max_abs": 0.001953125,
+      "per_query_max_abs": [
+        0.001953125
+      ],
+      "status": "pass"
+    },
+    {
+      "query_length": 2,
+      "strategy": "split",
+      "sparse_mode": 0,
+      "mask": "None",
+      "max_abs": 0.00390625,
+      "per_query_max_abs": [
+        0.001953125,
+        0.00390625
+      ],
+      "status": "pass"
+    },
+    {
+      "query_length": 4,
+      "strategy": "split",
+      "sparse_mode": 0,
+      "mask": "None",
+      "max_abs": 0.00390625,
+      "per_query_max_abs": [
+        0.00390625,
+        0.001953125,
+        0.0023193359375,
+        0.001953125
+      ],
+      "status": "pass"
+    }
+  ],
+  "summary": {
+    "strategy": "split",
+    "passed": 3,
+    "failed": 0,
+    "all_tested_cases_passed": true
+  }
+}
