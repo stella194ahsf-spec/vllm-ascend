@@ -53,13 +53,40 @@ vllm 仓库无未提交修改。
 
 ```
 branch : c8a16/pd-verified-20261119
-base   : c251a6a5ed5cc10f7ec6daa5b87d410d731bf6fd   (= 已验收旧环境的 vllm-ascend 基线)
+tip    : b574ec12589427a74cccb98f152dc62ad90e9ec3
+base   : e63a3c19795dd70eb7a12bcbd2a661c37d3bf097   (= 私仓 origin/main)
 ```
 
-以旧基线 commit 为父提交，把旧目录的实际改动原样打上，保证：
-- 四个修改文件与旧目录逐字节一致；
-- `attention_c8a16.py`、`test_attention_c8a16.py` 与旧目录逐字节一致；
-- 不混入私仓 main（`e63a3c197`）与旧基线之间的版本差异。
+```
+b574ec125  [C8A16] Add PD validation scripts, logs and environment baseline
+86cd64a37  [C8A16] Make dynamic INT8 KV scale planes PD-transferable
+e63a3c197  [Doc][Misc] Revise deployment config details and accuracy evaluation methods
+```
+
+### 为什么最终 rebase 到 origin/main
+
+最初按 `c251a6a5e`（已验收旧环境的基线）建分支，但该 commit 不在私仓远端历史中
+（私仓 main 为 `e63a3c197`，两者共同祖先只到 `ffca1c99`），推送需要携带 52 MB 对象，
+被公司出口网关 `netentsec` 拦截（该网关拒绝大于约 64 KB 的上传 POST）。
+
+改用 `git rebase --onto origin/main c251a6a5e` 重放两个提交后，推送量降到 110 KB + 52 KB，
+分两次推送成功。
+
+### rebase 的代价（重要）
+
+- 代码改动内容未变（仍是 949 insertions / 9 deletions 的六个文件），但**父提交变了**，
+  因此 `attention_v1.py` / `attn_utils.py` 等文件的上下文与旧基线不同。
+- `attn_utils.py` 有一处冲突：origin/main 新增了 EAGLE `is_draft` 标注逻辑，
+  与本改动的 `elif` 分支相邻。解决方式为**两者都保留**——C8A16 的 `elif` 在前，
+  EAGLE 的 `if` 在其后独立执行。
+- 因此**本分支尚未在 rebase 后的基线上跑过单测和 PD 验收**。旧基线上已验收的版本
+  保存在容器内 `backup/c8a16-validated-on-c251a6a5e` 分支，可用于对照。
+
+### 行尾
+
+所有代码与验证文件统一为 LF（仓库约定）。最初从 Windows 上传时带入了 CRLF，
+已在重新提交前全部规范化；`pd-*.log` 中残留的少量 `\r` 是 tqdm 进度条的真实输出
+（`\n\r`），非行尾污染。
 
 ## 4. 运行环境
 
