@@ -11,12 +11,14 @@ from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_c8a16 import (
     AscendC8A16AttentionBackendImpl,
     AscendC8A16MetadataBuilder,
+    _c8a16_query_ranges,
     _kv_paged_dequant_reference,
     c8a16_cache_spec,
     c8a16_cache_views_for_spec,
     scatter_c8a16_scale_cache,
     should_use_c8a16_dynamic,
 )
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder, AscendAttentionState
 
 NUM_KV_HEADS = 2
 HEAD_SIZE = 64
@@ -208,6 +210,170 @@ class TestC8A16GraphSupport(TestBase):
         )
 
 
+class TestC8A16Verification(TestC8A16PagedForward):
+    """Exercise real packed request boundaries, not a fixed draft width."""
+
+    def _metadata(self):
+        return SimpleNamespace(
+            num_actual_tokens=7,
+            actual_seq_lengths_q=[1, 3, 7, 9],
+            seq_lens_list=[127, 129, 133, 1],
+            block_tables=torch.tensor([[0, 1], [1, 2], [2, 0], [0, 0]]),
+        )
+
+    def test_ragged_queries_batch_by_position_and_preserve_padding(self):
+        metadata = self._metadata()
+        query = torch.randn(9, 4, HEAD_SIZE).bfloat16()
+        output = torch.full((9, 4 * HEAD_SIZE), -7, dtype=torch.bfloat16)
+        with patch("vllm_ascend.attention.attention_c8a16.torch_npu") as npu:
+            fia = npu.npu_fused_infer_attention_score
+            fia.side_effect = lambda q, *args, **kwargs: (q.clone(), None)
+            self._impl()._forward_c8a16_verification(query, metadata, output)
+        self.assertEqual(fia.call_count, 4)
+        expected = [([0, 1, 3], [127, 128, 130]), ([2, 4], [129, 131]), ([5], [132]), ([6], [133])]
+        for call, (tokens, lengths) in zip(fia.call_args_list, expected):
+            args, kwargs = call
+            torch.testing.assert_close(args[0].squeeze(1), query[tokens])
+            self.assertEqual(kwargs["actual_seq_lengths_kv"], lengths)
+            self.assertEqual(kwargs["actual_seq_lengths"], [1] * len(tokens))
+            self.assertEqual(kwargs["key_antiquant_mode"], 5)
+            self.assertEqual(kwargs["value_antiquant_mode"], 5)
+            self.assertEqual(kwargs["sparse_mode"], 0)
+            self.assertIsNone(kwargs["atten_mask"])
+        torch.testing.assert_close(output[:7], query[:7].flatten(1))
+        self.assertTrue(torch.all(output[7:] == -7))
+        torch.testing.assert_close(fia.call_args_list[0].kwargs["block_table"], metadata.block_tables[:3])
+        torch.testing.assert_close(fia.call_args_list[1].kwargs["block_table"], metadata.block_tables[1:3])
+
+    def test_malformed_boundaries_and_short_kv_fail_before_fia(self):
+        query = torch.randn(9, 4, HEAD_SIZE).bfloat16()
+        with patch("vllm_ascend.attention.attention_c8a16.torch_npu") as npu:
+            for ends, lengths in (([1, 3], [3, 5]), ([3, 1, 7], [3, 5, 9]), ([1, 3, 7], [3, 5, 2])):
+                metadata = self._metadata()
+                metadata.actual_seq_lengths_q = ends
+                metadata.seq_lens_list = lengths
+                with self.assertRaises(ValueError):
+                    self._impl()._forward_c8a16_verification(query, metadata, torch.zeros_like(query))
+            npu.npu_fused_infer_attention_score.assert_not_called()
+
+    def test_forward_routes_mixed_batch_without_using_short_prefill_as_decode(self):
+        impl = self._impl()
+        impl.kv_sharing_target_layer_name = None
+        from vllm.v1.attention.backend import AttentionType
+
+        impl.attn_type = AttentionType.DECODER
+        impl.sliding_window = impl.alibi_slopes = impl.sinks = None
+        impl.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
+        )
+        metadata = self._metadata()
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.attn_mask = torch.ones(1, 1)
+        metadata.c8a16_decode_requests = (0, 2)
+        query = torch.zeros(9, 4, HEAD_SIZE, dtype=torch.bfloat16)
+        with (
+            patch("vllm_ascend.attention.attention_c8a16._EXTRA_CTX", capturing=False),
+            patch.object(impl, "_bind_c8a16_caches"),
+            patch.object(impl, "_forward_c8a16_verification") as verification,
+            patch.object(impl, "_forward_c8a16_paged_attention") as prefill,
+        ):
+            impl.forward(SimpleNamespace(layer_name="layer.0"), query, None, None, None, metadata, query.clone())
+        self.assertEqual(verification.call_args.args[3], (0, 2))
+        self.assertEqual(prefill.call_args.args[3], (1,))
+
+    def test_partial_prefill_output_scatter_keeps_other_requests(self):
+        metadata = self._metadata()
+        # Use small valid page lengths for this CPU cache fixture.
+        metadata.seq_lens_list = [1, 2, 4, 1]
+        query = torch.randn(9, 4, HEAD_SIZE).bfloat16()
+        output = torch.full_like(query, -7)
+        metadata.attn_mask = None
+        with patch("vllm_ascend.attention.attention_c8a16.torch_npu") as npu:
+            npu.npu_fused_infer_attention_score.side_effect = lambda **kw: (kw["query"], None)
+            self._impl()._forward_c8a16_paged_attention(query, metadata, output, (1,))
+        torch.testing.assert_close(output[1:3], query[1:3])
+        self.assertTrue(torch.all(output[[0, 3, 4, 5, 6, 7, 8]] == -7))
+
+    def test_pad_slot_does_not_overwrite_last_scale(self):
+        scales = torch.full((3, 1, 4), 11.0)
+        scatter_c8a16_scale_cache(scales, torch.tensor([0, -1, 5]), torch.tensor([[2.0], [99.0], [3.0]]))
+        self.assertEqual(scales[0, 0, 0], 2)
+        self.assertEqual(scales[1, 0, 1], 3)
+        self.assertEqual(scales[2, 0, 3], 11)
+
+    def test_split_matches_independent_full_causal_attention(self):
+        impl = self._impl()
+        impl.key_cache = torch.randint(-127, 128, self.key_cache.shape, dtype=torch.int8)
+        impl.value_cache = torch.randint(-127, 128, self.key_cache.shape, dtype=torch.int8)
+        impl.k_scale_cache = torch.rand_like(self.scale_cache) * 0.01
+        impl.v_scale_cache = torch.rand_like(self.scale_cache) * 0.01
+        metadata = SimpleNamespace(
+            num_actual_tokens=7,
+            actual_seq_lengths_q=[1, 3, 7],
+            seq_lens_list=[2, 4, 8],
+            block_tables=torch.tensor([[2, 0], [1, 0], [0, 2]]),
+        )
+        query = torch.randn(7, 4, HEAD_SIZE).bfloat16()
+
+        def dense_rows(cache, scale, table, length):
+            cache = cache.reshape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+            positions = torch.arange(length)
+            pages, offsets = table[positions // BLOCK_SIZE], positions % BLOCK_SIZE
+            return (cache[pages, offsets].float() * scale[pages, :, offsets].unsqueeze(-1)).repeat_interleave(2, 1)
+
+        def fake_fia(q, key, value, **kwargs):
+            rows = []
+            for request, length in enumerate(kwargs["actual_seq_lengths_kv"]):
+                table = kwargs["block_table"][request]
+                k = dense_rows(key, impl.k_scale_cache, table, length)
+                v = dense_rows(value, impl.v_scale_cache, table, length)
+                scores = torch.einsum("hd,lhd->hl", q[request, 0].float(), k) * impl.scale
+                rows.append(torch.einsum("hl,lhd->hd", scores.softmax(-1), v))
+            return torch.stack(rows).unsqueeze(1).bfloat16(), None
+
+        output = torch.zeros_like(query)
+        with patch("vllm_ascend.attention.attention_c8a16.torch_npu") as npu:
+            npu.npu_fused_infer_attention_score.side_effect = fake_fia
+            impl._forward_c8a16_verification(query, metadata, output)
+        expected = []
+        for request, (start, end) in enumerate(zip([0, 1, 3], [1, 3, 7])):
+            length = metadata.seq_lens_list[request]
+            k = dense_rows(impl.key_cache, impl.k_scale_cache, metadata.block_tables[request], length)
+            v = dense_rows(impl.value_cache, impl.v_scale_cache, metadata.block_tables[request], length)
+            scores = torch.einsum("qhd,lhd->hql", query[start:end].float(), k) * impl.scale
+            causal = torch.arange(length)[None, :] <= length - (end - start) + torch.arange(end - start)[:, None]
+            scores.masked_fill_(~causal.unsqueeze(0), -torch.inf)
+            expected.append(torch.einsum("hql,lhd->qhd", scores.softmax(-1), v))
+        torch.testing.assert_close(output, torch.cat(expected).bfloat16(), rtol=0.02, atol=0.02)
+
+
+class TestC8A16SpecMetadata(TestBase):
+    def test_phase_flags_distinguish_short_prefill_from_verification(self):
+        builder = object.__new__(AscendC8A16MetadataBuilder)
+        common = SimpleNamespace(is_prefilling=torch.tensor([False, True, False]))
+        result = builder._build_backend_metadata(common, query_lens=torch.tensor([1, 2, 4]), num_decodes=3)
+        self.assertEqual(result["c8a16_decode_requests"], (0, 2))
+
+    def test_builder_uses_exact_device_lengths_instead_of_upper_bounds(self):
+        builder = object.__new__(AscendC8A16MetadataBuilder)
+        builder.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+        common = SimpleNamespace(num_reqs=3, seq_lens=torch.tensor([127, 129, 133]))
+        built = SimpleNamespace(seq_lens_list=[131, 133, 137, 1])
+        with patch.object(AscendAttentionMetadataBuilder, "build", return_value=built):
+            result = builder.build(0, common)
+        self.assertEqual(result.seq_lens_list, [127, 129, 133, 1])
+        self.assertEqual(result.seq_lens_cpu.tolist(), [127, 129, 133])
+
+    def test_zero_length_request_keeps_following_request_indices(self):
+        metadata = SimpleNamespace(
+            num_actual_tokens=3,
+            actual_seq_lengths_q=[0, 1, 3, 8],
+            seq_lens_list=[0, 5, 6, 1],
+            block_tables=torch.zeros(4, 1),
+        )
+        self.assertEqual(_c8a16_query_ranges(metadata), ([0, 0, 1], [0, 1, 3]))
+
+
 class TestC8A16RunnerOwnedCaches(TestBase):
     """The runner budgets the scale planes and hands over four components."""
 
@@ -310,6 +476,7 @@ class TestC8A16PaddedPage(TestBase):
         scaled = c8a16_cache_spec(base)
         padded_bytes = scaled.page_size_bytes + 4096
         padded = replace(scaled, page_size_padded=padded_bytes)
+        self.assertEqual(padded.page_size_bytes, padded_bytes)
         num_blocks = 2
         raw = torch.zeros(num_blocks * padded_bytes, dtype=torch.int8, device="cpu")
         k, v, ks, vs = c8a16_cache_views_for_spec(

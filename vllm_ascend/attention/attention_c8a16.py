@@ -17,18 +17,20 @@
 """Dynamic C8A16 KV cache with fused FIA mode-5 decode.
 
 New prefill computes attention with BF16 Q/K/V and caches INT8 K/V.
-Single-token decode reads the ND paged INT8 cache directly through the
-run-package extension to FIA. Other paged states use compact BF16 TND K/V.
+Decode and speculative verification read the ND paged INT8 cache through
+single-query calls to the run-package FIA extension. Cached prefills use
+compact BF16 TND K/V.
 """
 
 import math
 from bisect import bisect_right
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
@@ -49,12 +51,14 @@ from vllm_ascend.utils import C8_MXFP_KV_CACHE_DTYPE
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 C8A16_BLOCK_SIZE = 128
 C8A16_ANTIQUANT_MODE = 5
 C8A16_DECODE_SPARSE_MODE = 0
 C8A16_PREFILL_SPARSE_MODE = 3
 C8A16_SCALE_DTYPE = torch.float32
+logger = init_logger(__name__)
 
 
 def should_use_c8a16_dynamic(vllm_config: "VllmConfig", kv_cache_dtype: str | torch.dtype) -> bool:
@@ -139,9 +143,7 @@ def c8a16_cache_views_for_spec(
         raise ValueError("C8A16 physical page must be aligned to the fp32 scale dtype.")
     required = kernel_num_blocks * kernel_pitch_bytes
     if raw_tensor.numel() < required:
-        raise ValueError(
-            f"C8A16 allocation is smaller than its paged payload: {raw_tensor.numel()} < {required}."
-        )
+        raise ValueError(f"C8A16 allocation is smaller than its paged payload: {raw_tensor.numel()} < {required}.")
 
     # Keep the layer's own offset inside a shared hybrid backing allocation.
     base_offset = raw_tensor.storage_offset()
@@ -157,9 +159,7 @@ def c8a16_cache_views_for_spec(
     scale_strides = (kernel_pitch_bytes // dtype_size, kernel_block_size, 1)
     scale_base = base_offset // dtype_size + kv_page_bytes // dtype_size
     scale_tensor = raw_tensor.view(C8A16_SCALE_DTYPE)
-    k_scale = torch.as_strided(
-        scale_tensor, size=scale_shape, stride=scale_strides, storage_offset=scale_base
-    )
+    k_scale = torch.as_strided(scale_tensor, size=scale_shape, stride=scale_strides, storage_offset=scale_base)
     v_scale = torch.as_strided(
         scale_tensor,
         size=scale_shape,
@@ -189,6 +189,11 @@ def scatter_c8a16_scale_cache(scale_cache: torch.Tensor, slot_mapping: torch.Ten
     """
     _, num_heads, block_size = scale_cache.shape
     slots = slot_mapping.long()
+    # The payload scatter ignores PAD_SLOT_ID (-1). Scales must do the same,
+    # otherwise a skipped draft/padding token overwrites the last cache page.
+    valid = slots >= 0
+    slots = slots[valid]
+    scale = scale[valid]
     pages = slots // block_size
     offsets = slots % block_size
     heads = torch.arange(num_heads, device=scale_cache.device)
@@ -224,6 +229,31 @@ def _kv_paged_dequant_reference(
     return _gather_and_dequant(key_cache, k_scale_cache), _gather_and_dequant(value_cache, v_scale_cache)
 
 
+def _c8a16_query_ranges(metadata: AscendMetadata) -> tuple[list[int], list[int]]:
+    """Return real request ranges, excluding any appended graph padding."""
+    num_tokens = metadata.num_actual_tokens
+    ends = metadata.actual_seq_lengths_q
+    if ends is None or any(b < a for a, b in zip([0, *ends[:-1]], ends)):
+        raise ValueError("C8A16 query boundaries must be nondecreasing.")
+    ends = ends[: bisect_right(ends, num_tokens)]
+    if not ends or ends[-1] != num_tokens:
+        raise ValueError("C8A16 query boundaries must cover all actual tokens.")
+    starts = [0, *ends[:-1]]
+    lengths = metadata.seq_lens_list
+    if lengths is None or len(lengths) < len(ends) or metadata.block_tables.shape[0] < len(ends):
+        raise ValueError("C8A16 requires KV lengths and block rows for every real request.")
+    if any(lengths[i] < end - start for i, (start, end) in enumerate(zip(starts, ends))):
+        raise ValueError("C8A16 KV length is shorter than its query suffix.")
+    return starts, ends
+
+
+@dataclass
+class AscendC8A16Metadata(AscendMetadata):
+    # None is reserved for older manually constructed metadata. An empty
+    # tuple explicitly means that every request is a prefill.
+    c8a16_decode_requests: tuple[int, ...] | None = None
+
+
 class AscendC8A16MetadataBuilder(AscendAttentionMetadataBuilder):
     """Metadata builder for the dynamic C8A16 backend.
 
@@ -233,6 +263,36 @@ class AscendC8A16MetadataBuilder(AscendAttentionMetadataBuilder):
     compiled pieces) and FULL graph modes are rejected outright instead of
     capturing an incorrect graph.
     """
+
+    metadata_cls = AscendC8A16Metadata
+
+    def _build_backend_metadata(self, common_attn_metadata, *, query_lens, **kwargs):
+        # MRV2 reports speculative batches as ChunkedPrefill. Phase flags,
+        # rather than the enum or a fixed query width, distinguish them from
+        # genuine short prefills, including mixed batches.
+        flags = common_attn_metadata.is_prefilling
+        if flags is not None:
+            flags = flags.to(device="cpu").tolist()
+            decode_requests = tuple(i for i, flag in enumerate(flags) if not flag and query_lens[i] > 0)
+        elif common_attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding):
+            decode_requests = tuple(i for i, length in enumerate(query_lens.tolist()) if length > 0)
+        else:
+            decode_requests = tuple(range(kwargs["num_decodes"]))
+        return {"c8a16_decode_requests": decode_requests}
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if self.speculative_config is not None:
+            # Async speculative callers may expose only optimistic CPU upper
+            # bounds. Reading rejected draft slots would violate causality.
+            # Copy the authoritative post-rejection device lengths once per
+            # metadata build, never once per attention layer/query. This eager
+            # correctness path introduces a synchronization to profile on A3.
+            count = common_attn_metadata.num_reqs
+            exact = common_attn_metadata.seq_lens[:count].to(device="cpu")
+            metadata.seq_lens_list[:count] = exact.tolist()
+            metadata.seq_lens_cpu = exact
+        return metadata
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
@@ -340,6 +400,7 @@ class AscendC8A16AttentionBackendImpl(AscendAttentionBackendImpl):
         query: torch.Tensor,
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
+        request_indices: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         """Multi-token cached attention: gather+dequant, BF16 TND.
 
@@ -347,13 +408,18 @@ class AscendC8A16AttentionBackendImpl(AscendAttentionBackendImpl):
         ``_forward_c8_fused_infer_attention`` dense tail (sparse_mode=3 with
         the shared causal mask; block_table dropped after dequantization).
         """
-        num_tokens = attn_metadata.num_actual_tokens
-        q_ends = attn_metadata.actual_seq_lengths_q
-        actual_seq_qlen = q_ends[: bisect_right(q_ends, num_tokens)]
-        query = query[:num_tokens]
-
-        seq_lens = attn_metadata.seq_lens_list[: len(actual_seq_qlen)]
-        block_table = attn_metadata.block_tables[: len(seq_lens)]
+        starts, ends = _c8a16_query_ranges(attn_metadata)
+        if request_indices is None:
+            request_indices = tuple(range(len(ends)))
+        tokens = [t for i in request_indices for t in range(starts[i], ends[i])]
+        if not tokens:
+            return output
+        token_indices = torch.tensor(tokens, dtype=torch.long, device=query.device)
+        query = query.index_select(0, token_indices)
+        actual_seq_qlen = list(accumulate(ends[i] - starts[i] for i in request_indices))
+        seq_lens = [attn_metadata.seq_lens_list[i] for i in request_indices]
+        rows = torch.tensor(request_indices, dtype=torch.long, device=attn_metadata.block_tables.device)
+        block_table = attn_metadata.block_tables.index_select(0, rows)
         dense_k, dense_v = _kv_paged_dequant_reference(
             self.key_cache,
             self.value_cache,
@@ -380,8 +446,52 @@ class AscendC8A16AttentionBackendImpl(AscendAttentionBackendImpl):
             scale=self.scale,
             sparse_mode=C8A16_PREFILL_SPARSE_MODE,
         )
-        output_view = output[:num_tokens]
-        output_view.copy_(attn_output.reshape_as(output_view))
+        output.index_copy_(0, token_indices, attn_output.reshape(len(tokens), *output.shape[1:]))
+        return output
+
+    def _forward_c8a16_verification(self, query, attn_metadata, output, request_indices=None):
+        """Batch ragged requests at each query position using Sq=1 Mode 5.
+
+        With Q new queries and final valid KV length L, query j may see only
+        L-Q+j+1 tokens, even though all draft K/V have already been cached.
+        Rejected slots need no attention-side rollback: subsequent exact
+        lengths hide them and subsequent payload/scale scatters overwrite them.
+        GDN recurrent state rollback remains owned by the hybrid model runner.
+        """
+        starts, ends = _c8a16_query_ranges(attn_metadata)
+        if request_indices is None:
+            request_indices = tuple(range(len(ends)))
+        widths = [ends[i] - starts[i] for i in request_indices]
+        key_cache, value_cache, block_size = self._get_kv_cache_view(self.key_cache, self.value_cache)
+        for step in range(max(widths, default=0)):
+            active = [i for i in request_indices if ends[i] - starts[i] > step]
+            tokens = torch.tensor([starts[i] + step for i in active], dtype=torch.long, device=query.device)
+            rows = torch.tensor(active, dtype=torch.long, device=attn_metadata.block_tables.device)
+            visible = [attn_metadata.seq_lens_list[i] - (ends[i] - starts[i]) + step + 1 for i in active]
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query.index_select(0, tokens).unsqueeze(1).contiguous(),
+                key_cache,
+                value_cache,
+                key_antiquant_scale=self.k_scale_cache,
+                value_antiquant_scale=self.v_scale_cache,
+                key_antiquant_mode=C8A16_ANTIQUANT_MODE,
+                value_antiquant_mode=C8A16_ANTIQUANT_MODE,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                scale=self.scale,
+                block_table=attn_metadata.block_tables.index_select(0, rows).contiguous(),
+                block_size=block_size,
+                input_layout="BSND",
+                actual_seq_lengths=[1] * len(active),
+                actual_seq_lengths_kv=visible,
+                atten_mask=None,
+                sparse_mode=C8A16_DECODE_SPARSE_MODE,
+                inner_precise=0,
+            )
+            output.index_copy_(0, tokens, attn_output.reshape(len(active), *output.shape[1:]))
+            logger.info_once(
+                "C8A16_MODE5_VERIFICATION: paged INT8 KV, FP32 K/V scales, BSND Sq=1, sparse_mode=0, atten_mask=None."
+            )
         return output
 
     def _forward_c8a16_prefill(
@@ -474,8 +584,20 @@ class AscendC8A16AttentionBackendImpl(AscendAttentionBackendImpl):
         if key is not None and value is not None:
             self._quant_and_scatter_kv(key, value, attn_metadata)
 
-        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            tokens = attn_metadata.num_actual_tokens
-            if attn_metadata.actual_seq_lengths_q[:tokens] == list(range(1, tokens + 1)):
+        starts, ends = _c8a16_query_ranges(attn_metadata)
+        decode_requests = getattr(attn_metadata, "c8a16_decode_requests", None)
+        if decode_requests is None:
+            if attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding):
+                decode_requests = tuple(range(len(ends)))
+            else:
+                decode_requests = tuple(range(attn_metadata.num_decodes))
+        decode_requests = tuple(i for i in decode_requests if i < len(ends) and ends[i] > starts[i])
+        if decode_requests:
+            if len(decode_requests) == len(ends) and all(end - start == 1 for start, end in zip(starts, ends)):
                 return self._forward_c8a16_decode(query, attn_metadata, output)
+            self._forward_c8a16_verification(query, attn_metadata, output, decode_requests)
+            prefill_requests = tuple(i for i in range(len(ends)) if i not in decode_requests)
+            if prefill_requests:
+                self._forward_c8a16_paged_attention(query, attn_metadata, output, prefill_requests)
+            return output
         return self._forward_c8a16_prefill(query, key, value, attn_metadata, output)
